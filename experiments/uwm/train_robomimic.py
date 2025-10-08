@@ -117,6 +117,32 @@ def train(rank, world_size, config):
             f"Loaded pretraining checkpoint {config.pretrain_checkpoint_path}, step: {ckpt['step']}"
         )
 
+        # Use a smaller learning rate for the image encoder
+        encoder_params, other_params = [], []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith("obs_encoder.img_encoder"):
+                encoder_params.append(param)
+            else:
+                other_params.append(param)
+
+        # Define learning rates
+        base_lr = config.optimizer.lr
+        encoder_lr = base_lr * 0.05
+        wd = config.optimizer.weight_decay
+
+        # Construct optimizer with custom parameter groups
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": encoder_params, "lr": encoder_lr, "weight_decay": wd},
+                {"params": other_params, "lr": base_lr, "weight_decay": wd},
+            ],
+            betas=config.optimizer.betas,
+            eps=config.optimizer.eps,
+        )
+        scheduler = get_scheduler(optimizer=optimizer, **config.scheduler)
+
     # Resume from checkpoint
     step = maybe_resume_checkpoint(config, model, optimizer, scheduler, scaler)
     epoch = step // len(train_loader)
