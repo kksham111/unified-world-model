@@ -1,6 +1,6 @@
 hydra:
   run:
-    dir: /home/ubuntu/efs/chuning/logdir/${algo}/${dataset.name}/${exp_id}/${seed}
+    dir: /mnt/homes/jialin-ldap/UMAP/results/uwm_output/${algo}/${dataset.name}/${exp_id}/${seed}
 
 algo: ${hydra:runtime.choices.model}
 exp_id: default
