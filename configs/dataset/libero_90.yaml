@@ -6,6 +6,7 @@ name: libero_90
 # hdf5_path_globs: /home/ubuntu/LIBERO/libero/datasets/libero_90/*.hdf5
 # buffer_path: /home/ubuntu/LIBERO/libero/datasets/libero_90/buffer.zarr
 
-libero_root: ${oc.env:LIBERO_ROOT,/mnt/homes/jialin-ldap/UMAP/data/LIBERO_mod}
+libero_root: ${oc.env:LIBERO_ROOT,/inspire/hdd/project/robot-body/public/jltian/libero_data/}
 hdf5_path_globs: ${libero_root}/libero_90/*.hdf5
-buffer_path: ${libero_root}/libero_90/buffer.zarr
+buffer_root: ${oc.env:LIBERO_BUFFER_ROOT,/inspire/hdd/project/robot-body/public/jltian/UMAP/uwm_original}
+buffer_path: ${buffer_root}/libero_90/buffer.zarr
