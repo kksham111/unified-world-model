@@ -3,5 +3,9 @@ defaults:
   - _self_
 
 name: libero_90
-hdf5_path_globs: /home/ubuntu/LIBERO/libero/datasets/libero_90/*.hdf5
-buffer_path: /home/ubuntu/LIBERO/libero/datasets/libero_90/buffer.zarr
+# hdf5_path_globs: /home/ubuntu/LIBERO/libero/datasets/libero_90/*.hdf5
+# buffer_path: /home/ubuntu/LIBERO/libero/datasets/libero_90/buffer.zarr
+
+libero_root: ${oc.env:LIBERO_ROOT,/mnt/homes/jialin-ldap/UMAP/data/LIBERO_mod}
+hdf5_path_globs: ${libero_root}/libero_90/*.hdf5
+buffer_path: ${libero_root}/libero_90/buffer.zarr
