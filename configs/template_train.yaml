@@ -1,4 +1,4 @@
-log_root: ${oc.env:LOG_DIR,/inspire/hdd/project/robot-body/yanglixin-p-yanglixin/jialin/UMAP/workspace/logs}
+log_root: ${oc.env:LOG_DIR}
 
 hydra:
   run:
