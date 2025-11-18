@@ -40,15 +40,7 @@ class RobomimicDataset(Dataset):
                 self._lowdim_shapes[key] = obs_shape
             else:
                 raise RuntimeError(f"Unsupported obs type: {obs_type}")
-        
-        # Parse action shape (original code)
         self._action_shape = tuple(shape_meta["action"]["shape"])
-        
-        # Parse traj3d shape (照搬 action 的处理方式)
-        self._has_traj3d = "traj3d" in shape_meta
-        if self._has_traj3d:
-            self._traj3d_shape = tuple(shape_meta["traj3d"]["shape"])
-            print(f"[Motion] traj3d detected in shape_meta with shape: {self._traj3d_shape}")
 
         # Compressed buffer to store episode data
         self.buffer = self._init_buffer(hdf5_path_globs, buffer_path)
@@ -91,13 +83,7 @@ class RobomimicDataset(Dataset):
             metadata[f"obs.{key}"] = {"shape": shape, "dtype": np.uint8}
         for key, shape in self._lowdim_shapes.items():
             metadata[f"obs.{key}"] = {"shape": shape, "dtype": np.float32}
-        
-        # Add action to metadata (original code)
         metadata["action"] = {"shape": self._action_shape, "dtype": np.float32}
-        
-        # Add traj3d to metadata (照搬 action 的处理方式)
-        if self._has_traj3d:
-            metadata["traj3d"] = {"shape": self._traj3d_shape, "dtype": np.float32}
 
         # Compute buffer capacity
         capacity = 0
@@ -129,8 +115,6 @@ class RobomimicDataset(Dataset):
                 for i in range(len(demos)):
                     demo = demos[f"demo_{i}"]
                     episode = {}
-                    
-                    # Load observations (original code)
                     for key in self._image_shapes.keys():
                         if self.flip_rgb:
                             episode[f"obs.{key}"] = demo["obs"][key][:][:, ::-1]
@@ -138,25 +122,7 @@ class RobomimicDataset(Dataset):
                             episode[f"obs.{key}"] = demo["obs"][key][:]
                     for key in self._lowdim_shapes.keys():
                         episode[f"obs.{key}"] = demo["obs"][key][:]
-                    
-                    # Load action (original code)
                     episode["action"] = demo["actions"][:]
-                    
-                    # Load traj3d (照搬 action 的处理方式，增加向后兼容)
-                    if self._has_traj3d:
-                        # 优先尝试新的 key 名称 "traj3d"
-                        if "traj3d" in demo:
-                            episode["traj3d"] = demo["traj3d"][:]
-                        # 向后兼容旧的 key 名称 "3d_traj"
-                        elif "3d_traj" in demo:
-                            episode["traj3d"] = demo["3d_traj"][:]
-                            print(f"[Motion] Using backward compatible key '3d_traj' in demo_{i}")
-                        else:
-                            raise RuntimeError(
-                                f"[Motion] traj3d data not found in demo_{i} of {hdf5_path}. "
-                                f"Expected key 'traj3d' or '3d_traj' but neither exists."
-                            )
-                    
                     buffer.add_episode(episode)
                     pbar.update(1)
         pbar.close()
@@ -169,15 +135,7 @@ class RobomimicDataset(Dataset):
         return f"<RobomimicDataset>\nname: {self.name}\nnum_samples: {len(self)}\n{self.buffer}"
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        """
-        Sample a sequence and apply preprocessing
-        
-        数据流：
-        1. 从 buffer 采样序列（包含 obs, action, traj3d）
-        2. 转换为 torch.Tensor
-        3. Unflatten observations
-        """
-        # Sample a sequence of observations and actions from the dataset
+        # Sample a sequence of observations and actions from the dataset.
         data = self.sampler.sample_sequence(idx)
 
         # Convert data to torch tensors

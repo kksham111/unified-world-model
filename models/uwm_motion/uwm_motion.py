@@ -91,6 +91,9 @@ class DualNoisePredictionNet(nn.Module):
         num_views: int,
         action_len: int,
         action_dim: int,
+        traj3d_len: int = 0,
+        traj3d_points: int = 0,
+        traj3d_dim: int = 3,
         embed_dim: int = 768,
         timestep_embed_dim: int = 512,
         depth: int = 12,
@@ -111,17 +114,39 @@ class DualNoisePredictionNet(nn.Module):
         obs_len = self.obs_patchifier.num_patches
 
         # Action encoder and decoder
-        hidden_dim = int(max(action_dim, embed_dim) * mlp_ratio)
+        hidden_dim_action = int(max(action_dim, embed_dim) * mlp_ratio)
         self.action_encoder = nn.Sequential(
-            nn.Linear(action_dim, hidden_dim),
+            nn.Linear(action_dim, hidden_dim_action),
             nn.Mish(),
-            nn.Linear(hidden_dim, embed_dim),
+            nn.Linear(hidden_dim_action, embed_dim),
         )
         self.action_decoder = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
+            nn.Linear(embed_dim, hidden_dim_action),
             nn.Mish(),
-            nn.Linear(hidden_dim, action_dim),
+            nn.Linear(hidden_dim_action, action_dim),
         )
+
+        # 3D Trajectory encoder and decoder (照搬 action 的处理方式)
+        self.use_traj3d = traj3d_len > 0 and traj3d_points > 0
+        if self.use_traj3d:
+            # Flatten points: (traj3d_points, traj3d_dim) -> (traj3d_points * traj3d_dim)
+            traj3d_total_dim = traj3d_points * traj3d_dim
+            hidden_dim_traj = int(max(traj3d_total_dim, embed_dim) * mlp_ratio)
+            self.traj3d_encoder = nn.Sequential(
+                nn.Linear(traj3d_total_dim, hidden_dim_traj),
+                nn.Mish(),
+                nn.Linear(hidden_dim_traj, embed_dim),
+            )
+            self.traj3d_decoder = nn.Sequential(
+                nn.Linear(embed_dim, hidden_dim_traj),
+                nn.Mish(),
+                nn.Linear(hidden_dim_traj, traj3d_total_dim),
+            )
+            self.traj3d_len = traj3d_len
+            self.traj3d_points = traj3d_points
+            self.traj3d_dim = traj3d_dim
+        else:
+            self.traj3d_len = 0
 
         # Timestep embedding
         self.timestep_embedding = DualTimestepEncoder(timestep_embed_dim)
@@ -131,8 +156,11 @@ class DualNoisePredictionNet(nn.Module):
             torch.empty(1, num_registers, embed_dim).normal_(std=0.02)
         )
 
-        # Positional embedding
-        total_len = action_len + obs_len + num_registers
+        # Positional embedding (更新长度以包含 traj3d)
+        if self.use_traj3d:
+            total_len = action_len + self.traj3d_len + obs_len + num_registers
+        else:
+            total_len = action_len + obs_len + num_registers
         self.pos_embed = nn.Parameter(
             torch.empty(1, total_len, embed_dim).normal_(std=0.02)
         )
@@ -152,8 +180,14 @@ class DualNoisePredictionNet(nn.Module):
             ]
         )
         self.head = AdaLNFinalLayer(dim=embed_dim, cond_dim=cond_dim)
+        
+        # 更新序列索引 (action, traj3d, next_obs)
         self.action_inds = (0, action_len)
-        self.next_obs_inds = (action_len, action_len + obs_len)
+        if self.use_traj3d:
+            self.traj3d_inds = (action_len, action_len + self.traj3d_len)
+            self.next_obs_inds = (action_len + self.traj3d_len, action_len + self.traj3d_len + obs_len)
+        else:
+            self.next_obs_inds = (action_len, action_len + obs_len)
 
         # AdaLN-specific weight initialization
         self.initialize_weights()
@@ -178,9 +212,38 @@ class DualNoisePredictionNet(nn.Module):
         nn.init.constant_(self.head.linear.weight, 0)
         nn.init.constant_(self.head.linear.bias, 0)
 
-    def forward(self, global_cond, action, action_t, next_obs, next_obs_t):
-        # Encode inputs
+    def forward(self, global_cond, action, action_t, next_obs, next_obs_t, traj3d=None, traj3d_t=None):
+        """
+        Forward pass with optional traj3d support (照搬 action 的处理方式)
+        
+        Args:
+            global_cond: Global conditioning (B, cond_dim)
+            action: Action sequence (B, action_len, action_dim)
+            action_t: Action diffusion timestep
+            next_obs: Next observation (B, num_views, num_chans, T, H, W)
+            next_obs_t: Observation diffusion timestep
+            traj3d: 3D trajectory (B, traj3d_len, traj3d_points, traj3d_dim), optional
+            traj3d_t: Traj3d diffusion timestep, optional
+        
+        Returns:
+            action_noise_pred: (B, action_len, action_dim)
+            traj3d_noise_pred: (B, traj3d_len, traj3d_points, traj3d_dim) or None
+            next_obs_noise_pred: (B, num_views, num_chans, T, H, W)
+        """
+        # Encode action (original)
         action_embed = self.action_encoder(action)
+        
+        # Encode traj3d if provided (照搬 action 的编码方式)
+        if self.use_traj3d and traj3d is not None:
+            # traj3d shape: (B, traj3d_len, traj3d_points, traj3d_dim)
+            B, T, N, D = traj3d.shape
+            # Flatten points: (B, T, N*D) 以便 encoder 处理
+            traj3d_flat = traj3d.reshape(B, T, -1)
+            traj3d_embed = self.traj3d_encoder(traj3d_flat)  # (B, T, embed_dim)
+        else:
+            traj3d_embed = None
+        
+        # Encode next observation (original)
         next_obs_embed = self.obs_patchifier(next_obs)
 
         # Expand and encode timesteps
@@ -192,25 +255,55 @@ class DualNoisePredictionNet(nn.Module):
             next_obs_t = next_obs_t.expand(next_obs.shape[0]).to(
                 dtype=torch.long, device=next_obs.device
             )
-        temb = self.timestep_embedding(action_t, next_obs_t)
+        
+        # If traj3d is used, use its timestep for the first position of dual timestep
+        # (照搬 action 的时间步处理方式)
+        if self.use_traj3d and traj3d is not None and traj3d_t is not None:
+            if len(traj3d_t.shape) == 0:
+                traj3d_t = traj3d_t.expand(traj3d.shape[0]).to(
+                    dtype=torch.long, device=traj3d.device
+                )
+            # Use traj3d_t and next_obs_t as dual timesteps
+            temb = self.timestep_embedding(traj3d_t, next_obs_t)
+        else:
+            # Original: use action_t and next_obs_t
+            temb = self.timestep_embedding(action_t, next_obs_t)
 
-        # Forward through model
+        # Forward through model (拼接 action, traj3d, next_obs)
         registers = self.registers.expand(next_obs.shape[0], -1, -1)
-        x = torch.cat((action_embed, next_obs_embed, registers), dim=1)
+        if self.use_traj3d and traj3d_embed is not None:
+            x = torch.cat((action_embed, traj3d_embed, next_obs_embed, registers), dim=1)
+        else:
+            x = torch.cat((action_embed, next_obs_embed, registers), dim=1)
         x = x + self.pos_embed
         cond = torch.cat((global_cond, temb), dim=-1)
         for block in self.blocks:
             x = block(x, cond)
         x = self.head(x, cond)
 
-        # Extract action and next observation noise predictions
+        # Extract predictions (从拼接的序列中提取各部分)
         action_noise_pred = x[:, self.action_inds[0] : self.action_inds[1]]
+        if self.use_traj3d:
+            traj3d_noise_pred = x[:, self.traj3d_inds[0] : self.traj3d_inds[1]]
         next_obs_noise_pred = x[:, self.next_obs_inds[0] : self.next_obs_inds[1]]
 
         # Decode outputs
         action_noise_pred = self.action_decoder(action_noise_pred)
+        
+        # Decode traj3d if applicable (照搬 action 的解码方式)
+        if self.use_traj3d and traj3d is not None:
+            traj3d_noise_pred = self.traj3d_decoder(traj3d_noise_pred)
+            # Reshape back: (B, T, N*D) -> (B, T, N, D)
+            B_out = traj3d_noise_pred.shape[0]
+            traj3d_noise_pred = traj3d_noise_pred.reshape(
+                B_out, self.traj3d_len, self.traj3d_points, self.traj3d_dim
+            )
+        else:
+            traj3d_noise_pred = None
+        
         next_obs_noise_pred = self.obs_patchifier.unpatchify(next_obs_noise_pred)
-        return action_noise_pred, next_obs_noise_pred
+        
+        return action_noise_pred, traj3d_noise_pred, next_obs_noise_pred
 
 
 class UnifiedWorldModelWithMotion(nn.Module):
@@ -219,6 +312,9 @@ class UnifiedWorldModelWithMotion(nn.Module):
         action_len: int,
         action_dim: int,
         obs_encoder: UWMObservationEncoder,
+        traj3d_len: int = 0,
+        traj3d_points: int = 0,
+        traj3d_dim: int = 3,
         embed_dim: int = 768,
         timestep_embed_dim: int = 512,
         latent_patch_shape: tuple[int, ...] = (2, 4, 4),
@@ -242,6 +338,14 @@ class UnifiedWorldModelWithMotion(nn.Module):
         self.action_dim = action_dim
         self.action_shape = (action_len, action_dim)
 
+        # 3D Trajectory parameters (照搬 action 的处理方式)
+        self.use_traj3d = traj3d_len > 0 and traj3d_points > 0
+        self.traj3d_len = traj3d_len
+        self.traj3d_points = traj3d_points
+        self.traj3d_dim = traj3d_dim
+        if self.use_traj3d:
+            self.traj3d_shape = (traj3d_len, traj3d_points, traj3d_dim)
+
         # Image augmentation
         self.obs_encoder = obs_encoder
         self.latent_img_shape = self.obs_encoder.latent_img_shape()
@@ -258,6 +362,9 @@ class UnifiedWorldModelWithMotion(nn.Module):
             num_views=num_views,
             action_len=action_len,
             action_dim=action_dim,
+            traj3d_len=traj3d_len,
+            traj3d_points=traj3d_points,
+            traj3d_dim=traj3d_dim,
             embed_dim=embed_dim,
             timestep_embed_dim=timestep_embed_dim,
             depth=depth,
@@ -276,7 +383,7 @@ class UnifiedWorldModelWithMotion(nn.Module):
             clip_sample=clip_sample,
         )
 
-    def forward(self, obs_dict, next_obs_dict, action, action_mask=None):
+    def forward(self, obs_dict, next_obs_dict, action, traj3d=None, action_mask=None, traj3d_mask=None):
         batch_size, device = action.shape[0], action.device
 
         # Encode observations
@@ -284,7 +391,7 @@ class UnifiedWorldModelWithMotion(nn.Module):
             obs_dict, next_obs_dict
         )
 
-        # Sample diffusion timestep for action
+        # Sample diffusion timestep for action (照搬原有 action 的处理方式)
         action_noise = torch.randn_like(action)
         action_t = torch.randint(
             low=0, high=self.num_train_steps, size=(batch_size,), device=device
@@ -292,6 +399,20 @@ class UnifiedWorldModelWithMotion(nn.Module):
         if action_mask is not None:
             action_t[~action_mask] = self.num_train_steps - 1
         noisy_action = self.noise_scheduler.add_noise(action, action_noise, action_t)
+
+        # Sample diffusion timestep for traj3d (照搬 action 的处理方式)
+        if self.use_traj3d and traj3d is not None:
+            traj3d_noise = torch.randn_like(traj3d)
+            traj3d_t = torch.randint(
+                low=0, high=self.num_train_steps, size=(batch_size,), device=device
+            ).long()
+            if traj3d_mask is not None:
+                traj3d_t[~traj3d_mask] = self.num_train_steps - 1
+            noisy_traj3d = self.noise_scheduler.add_noise(traj3d, traj3d_noise, traj3d_t)
+        else:
+            traj3d_noise = None
+            traj3d_t = None
+            noisy_traj3d = None
 
         # Sample diffusion timestep for next observation
         next_obs_noise = torch.randn_like(next_obs)
@@ -303,12 +424,19 @@ class UnifiedWorldModelWithMotion(nn.Module):
         )
 
         # Diffusion loss
-        action_noise_pred, next_obs_noise_pred = self.noise_pred_net(
-            obs, noisy_action, action_t, noisy_next_obs, next_obs_t
+        action_noise_pred, traj3d_noise_pred, next_obs_noise_pred = self.noise_pred_net(
+            obs, noisy_action, action_t, noisy_next_obs, next_obs_t, noisy_traj3d, traj3d_t
         )
         action_loss = F.mse_loss(action_noise_pred, action_noise)
         dynamics_loss = F.mse_loss(next_obs_noise_pred, next_obs_noise)
-        loss = action_loss + dynamics_loss
+        
+        # 计算 traj3d 损失 (照搬 action 的损失计算方式)
+        if self.use_traj3d and traj3d is not None and traj3d_noise_pred is not None:
+            traj3d_loss = F.mse_loss(traj3d_noise_pred, traj3d_noise)
+            loss = action_loss + traj3d_loss + dynamics_loss
+        else:
+            traj3d_loss = None
+            loss = action_loss + dynamics_loss
 
         # Logging
         info = {
@@ -316,6 +444,9 @@ class UnifiedWorldModelWithMotion(nn.Module):
             "action_loss": action_loss.item(),
             "dynamics_loss": dynamics_loss.item(),
         }
+        if traj3d_loss is not None:
+            info["traj3d_loss"] = traj3d_loss.item()
+        
         return loss, info
 
     @torch.no_grad()

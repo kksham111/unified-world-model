@@ -26,11 +26,16 @@ def process_batch(batch, obs_horizon, action_horizon, device):
     next_obs = {k: v[:, action_end:].to(device) for k, v in batch["obs"].items()}
     actions = batch["action"][:, action_start:action_end].to(device)
 
+    # Add traj3d if present (照搬 action 的处理方式)
+    traj3d = None
+    if "traj3d" in batch:
+        traj3d = batch["traj3d"][:, action_start:action_end].to(device)
+
     # Add language tokens
     if "input_ids" in batch and "attention_mask" in batch:
         curr_obs["input_ids"] = batch["input_ids"].to(device)
         curr_obs["attention_mask"] = batch["attention_mask"].to(device)
-    return curr_obs, next_obs, actions
+    return curr_obs, next_obs, actions, traj3d
 
 
 def eval_one_epoch(config, data_loader, device, model, action_normalizer=None):
@@ -56,6 +61,7 @@ def eval_one_epoch(config, data_loader, device, model, action_normalizer=None):
         "loss": 0,
         "action_loss": 0,
         "dynamics_loss": 0,
+        "traj3d_loss": 0,  # 添加 traj3d_loss 统计
         "action_mse_marginal": 0,
         "action_mse_joint": 0,
         "action_mse_inv": 0,
@@ -65,13 +71,13 @@ def eval_one_epoch(config, data_loader, device, model, action_normalizer=None):
     }
     for batch in tqdm(data_loader, desc="Evaluating", disable=not is_main_process()):
         # ------------ Preprocess data ------------ #
-        curr_obs_dict, next_obs_dict, action_norm = process_batch(
+        curr_obs_dict, next_obs_dict, action_norm, traj3d = process_batch(
             batch, config.model.obs_encoder.num_frames, config.model.action_len, device
         )
 
         with torch.no_grad():
             # ------------ Validation loss ------------ #
-            _, info = model(curr_obs_dict, next_obs_dict, action_norm)
+            _, info = model(curr_obs_dict, next_obs_dict, action_norm, traj3d)
             for k, v in info.items():
                 stats[k] += v
 
@@ -131,7 +137,7 @@ def train_one_step(config, model, optimizer, scheduler, scaler, batch, device):
     model.train()
 
     # --- Preprocess data ---
-    curr_obs, next_obs, action = process_batch(
+    curr_obs, next_obs, action, traj3d = process_batch(
         batch, config.model.obs_encoder.num_frames, config.model.action_len, device
     )
 
@@ -140,7 +146,10 @@ def train_one_step(config, model, optimizer, scheduler, scaler, batch, device):
     with torch.autocast(
         device_type="cuda", dtype=torch.bfloat16, enabled=config.use_amp
     ):
-        loss, info = model(curr_obs, next_obs, action, batch.get("action_mask", None))
+        loss, info = model(
+            curr_obs, next_obs, action, traj3d, 
+            batch.get("action_mask", None), batch.get("traj3d_mask", None)
+        )
 
     # Step optimizer
     optimizer.zero_grad()

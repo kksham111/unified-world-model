@@ -1,11 +1,16 @@
-_target_: models.uwm_motion.UnifiedWorldModelWithMotion
+_target_: dependencies.uwm.models.uwm_motion.uwm_motion.UnifiedWorldModelWithMotion
 action_len: 16
 action_dim: ${dataset.shape_meta.action.shape[0]}
+
+traj3d_len: 16  # 与 action_len 保持一致
+traj3d_points: ${dataset.shape_meta.traj3d.shape[0]}
+traj3d_dim: ${dataset.shape_meta.traj3d.shape[1]}
+
 obs_encoder:
-  _target_: models.uwm_motion.UWMObservationEncoder
+  _target_: models.uwm.UWMObservationEncoder
   shape_meta: ${dataset.shape_meta}
   num_frames: ${obs_num_frames}
-  embed_dim: 768  
+  embed_dim: 768
   resize_shape: [240, 320]
   crop_shape: [224, 224]
   random_crop: True

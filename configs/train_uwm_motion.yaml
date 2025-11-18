@@ -1,5 +1,5 @@
 defaults:
-  - dataset: libero_90
+  - dataset: libero_90_motion
   - model: uwm_motion
   - template_train_robomimic
   - _self_
