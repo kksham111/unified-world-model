@@ -1,6 +1,8 @@
+log_root: ${oc.env:LOG_DIR}
+
 hydra:
   run:
-    dir: /home/ubuntu/efs/chuning/logdir/${algo}/${dataset.name}/${exp_id}/${seed}
+    dir: ${log_root}/${algo}/${dataset.name}/${exp_id}/${seed}
 
 algo: ${hydra:runtime.choices.model}
 exp_id: default
