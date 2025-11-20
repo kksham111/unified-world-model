@@ -1,8 +1,11 @@
 _target_: dependencies.uwm.datasets.robomimic.make_robomimic_dataset
-name: libero_90_motion
-hdf5_path_globs: /mnt/homes/jialin-ldap/UMAP/workspace/output/libero_hdf5_merged/libero_90_test/*.hdf5
-buffer_path: /mnt/homes/jialin-ldap/UMAP/workspace/output/uwm_training_output/libero_90_motion/buffer.zarr
+name: libero_90_test_framestride_3
+# hdf5_path_globs: /mnt/homes/jialin-ldap/UMAP/workspace/output/libero_hdf5_merged/libero_90_test_framestride_3/*.hdf5
+# buffer_path: /mnt/homes/jialin-ldap/UMAP/workspace/output/uwm_training_output/libero_90_test_framestride_3/buffer.zarr
 # normalize_action: true
+
+hdf5_path_globs: ${oc.env:LIBERO_ROOT}/${name}/*.hdf5
+buffer_path: ${oc.env:LIBERO_BUFFER_ROOT}/${name}/buffer.zarr
 
 shape_meta:
   obs:
