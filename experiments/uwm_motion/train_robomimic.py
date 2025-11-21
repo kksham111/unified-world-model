@@ -96,7 +96,7 @@ def train(rank, world_size, config):
 
     # Initialize WANDB
     if is_main_process():
-        os.environ["WANDB_MODE"] = "offline"
+        os.environ.setdefault("WANDB_MODE", "offline")
         init_wandb(config, job_type="train")
 
     # Create dataset and loader

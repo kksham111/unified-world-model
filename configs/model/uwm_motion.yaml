@@ -1,4 +1,4 @@
-_target_: dependencies.uwm.models.uwm_motion.uwm_motion.UnifiedWorldModelWithMotion
+_target_: dependencies.uwm_motion.models.uwm_motion.uwm_motion.UnifiedWorldModelWithMotion
 action_len: 16
 action_dim: ${dataset.shape_meta.action.shape[0]}
 
