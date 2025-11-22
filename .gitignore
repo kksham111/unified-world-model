@@ -37,3 +37,13 @@ wandb/
 logs/
 
 .sii/ide-port
+
+datasets/__init__.py
+.gitignore
+datasets/utils/__init__.py
+.gitignore
+environments/__init__.py
+.gitignore
+experiments/__init__.py
+.gitignore
+__init__.py
