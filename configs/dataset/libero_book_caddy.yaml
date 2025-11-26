@@ -1,3 +1,7 @@
 defaults:
   - template_libero
   - _self_
+
+name: libero_book_caddy
+hdf5_path_globs: /inspire/hdd/project/robot-body/public/jltian/libero_data/libero_10/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy_demo.hdf5
+buffer_path: /inspire/ssd/project/robot-body/yanglixin-p-yanglixin/jialin/data/uwm_offline/libero_10/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy_demo.zarr
