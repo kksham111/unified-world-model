@@ -35,3 +35,4 @@ num_train_steps: 100
 num_inference_steps: 10
 beta_schedule: squaredcos_cap_v2
 clip_sample: True
+use_triple_timestep: True  # 使用 TriNoisePredictionNet (3个独立时间步)

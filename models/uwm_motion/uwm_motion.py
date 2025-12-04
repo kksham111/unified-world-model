@@ -81,6 +81,28 @@ class DualTimestepEncoder(nn.Module):
         return self.proj(temb)
 
 
+class TripleTimestepEncoder(nn.Module):
+    """
+    用于处理三个独立时间步（Action, Traj3D, Next Obs）的编码器。
+    """
+    def __init__(self, embed_dim: int = 512, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.sinusoidal_pos_emb = SinusoidalPosEmb(embed_dim)
+        hidden_dim = int(embed_dim * mlp_ratio)
+        self.proj = nn.Sequential(
+            nn.Linear(embed_dim * 3, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+    def forward(self, t1, t2, t3):
+        temb1 = self.sinusoidal_pos_emb(t1)
+        temb2 = self.sinusoidal_pos_emb(t2)
+        temb3 = self.sinusoidal_pos_emb(t3)
+        temb = torch.cat([temb1, temb2, temb3], dim=-1)
+        return self.proj(temb)
+
+
 class DualNoisePredictionNet(nn.Module):
     def __init__(
         self,
@@ -306,6 +328,198 @@ class DualNoisePredictionNet(nn.Module):
         return action_noise_pred, traj3d_noise_pred, next_obs_noise_pred
 
 
+class TriNoisePredictionNet(nn.Module):
+    """
+    三时间步噪声预测网络，强制要求 traj3d 输入。
+    使用 TripleTimestepEncoder 处理 Action, Traj3D, Next Obs 三个独立时间步。
+    """
+    def __init__(
+        self,
+        global_cond_dim: int,
+        image_shape: tuple[int, ...],
+        patch_shape: tuple[int, ...],
+        num_chans: int,
+        num_views: int,
+        action_len: int,
+        action_dim: int,
+        traj3d_len: int,
+        traj3d_points: int,
+        traj3d_dim: int = 3,
+        embed_dim: int = 768,
+        timestep_embed_dim: int = 512,
+        depth: int = 12,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        num_registers: int = 8,
+    ):
+        super().__init__()
+        
+        # 强制要求 traj3d
+        assert traj3d_len > 0 and traj3d_points > 0, "TriNoisePredictionNet requires traj3d_len > 0 and traj3d_points > 0"
+        
+        # Observation encoder and decoder
+        self.obs_patchifier = MultiViewVideoPatchifier(
+            num_views=num_views,
+            input_shape=image_shape,
+            patch_shape=patch_shape,
+            num_chans=num_chans,
+            embed_dim=embed_dim,
+        )
+        obs_len = self.obs_patchifier.num_patches
+
+        # Action encoder and decoder
+        hidden_dim_action = int(max(action_dim, embed_dim) * mlp_ratio)
+        self.action_encoder = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim_action),
+            nn.Mish(),
+            nn.Linear(hidden_dim_action, embed_dim),
+        )
+        self.action_decoder = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim_action),
+            nn.Mish(),
+            nn.Linear(hidden_dim_action, action_dim),
+        )
+
+        # 3D Trajectory encoder and decoder (强制启用)
+        self.traj3d_len = traj3d_len
+        self.traj3d_points = traj3d_points
+        self.traj3d_dim = traj3d_dim
+        traj3d_total_dim = traj3d_points * traj3d_dim
+        hidden_dim_traj = int(max(traj3d_total_dim, embed_dim) * mlp_ratio)
+        self.traj3d_encoder = nn.Sequential(
+            nn.Linear(traj3d_total_dim, hidden_dim_traj),
+            nn.Mish(),
+            nn.Linear(hidden_dim_traj, embed_dim),
+        )
+        self.traj3d_decoder = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim_traj),
+            nn.Mish(),
+            nn.Linear(hidden_dim_traj, traj3d_total_dim),
+        )
+
+        # Triple Timestep embedding
+        self.timestep_embedding = TripleTimestepEncoder(timestep_embed_dim)
+
+        # Registers
+        self.registers = nn.Parameter(
+            torch.empty(1, num_registers, embed_dim).normal_(std=0.02)
+        )
+
+        # Positional embedding
+        total_len = action_len + traj3d_len + obs_len + num_registers
+        self.pos_embed = nn.Parameter(
+            torch.empty(1, total_len, embed_dim).normal_(std=0.02)
+        )
+
+        # DiT blocks
+        cond_dim = global_cond_dim + timestep_embed_dim
+        self.blocks = nn.ModuleList(
+            [
+                AdaLNAttentionBlock(
+                    dim=embed_dim,
+                    cond_dim=cond_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.head = AdaLNFinalLayer(dim=embed_dim, cond_dim=cond_dim)
+        
+        # 序列索引
+        self.action_inds = (0, action_len)
+        self.traj3d_inds = (action_len, action_len + traj3d_len)
+        self.next_obs_inds = (action_len + traj3d_len, action_len + traj3d_len + obs_len)
+
+        # Weight initialization
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        self.apply(init_weights)
+        w = self.obs_patchifier.patch_encoder.weight.data
+        nn.init.normal_(w.view([w.shape[0], -1]), mean=0.0, std=0.02)
+        nn.init.constant_(self.obs_patchifier.patch_encoder.bias, 0)
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.head.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.head.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.head.linear.weight, 0)
+        nn.init.constant_(self.head.linear.bias, 0)
+
+    def forward(self, global_cond, action, action_t, next_obs, next_obs_t, traj3d, traj3d_t):
+        """
+        Forward pass with mandatory traj3d support.
+        
+        Args:
+            global_cond: Global conditioning (B, cond_dim)
+            action: Action sequence (B, action_len, action_dim)
+            action_t: Action diffusion timestep
+            next_obs: Next observation (B, num_views, num_chans, T, H, W)
+            next_obs_t: Observation diffusion timestep
+            traj3d: 3D trajectory (B, traj3d_len, traj3d_points, traj3d_dim) - REQUIRED
+            traj3d_t: Traj3d diffusion timestep - REQUIRED
+        
+        Returns:
+            action_noise_pred: (B, action_len, action_dim)
+            traj3d_noise_pred: (B, traj3d_len, traj3d_points, traj3d_dim)
+            next_obs_noise_pred: (B, num_views, num_chans, T, H, W)
+        """
+        assert traj3d is not None and traj3d_t is not None, "TriNoisePredictionNet requires traj3d and traj3d_t"
+        
+        # Encode action
+        action_embed = self.action_encoder(action)
+        
+        # Encode traj3d
+        B, T, N, D = traj3d.shape
+        traj3d_flat = traj3d.reshape(B, T, -1)
+        traj3d_embed = self.traj3d_encoder(traj3d_flat)
+        
+        # Encode next observation
+        next_obs_embed = self.obs_patchifier(next_obs)
+
+        # Expand timesteps
+        if len(action_t.shape) == 0:
+            action_t = action_t.expand(action.shape[0]).to(
+                dtype=torch.long, device=action.device
+            )
+        if len(next_obs_t.shape) == 0:
+            next_obs_t = next_obs_t.expand(next_obs.shape[0]).to(
+                dtype=torch.long, device=next_obs.device
+            )
+        if len(traj3d_t.shape) == 0:
+            traj3d_t = traj3d_t.expand(B).to(dtype=torch.long, device=traj3d.device)
+
+        
+        # Triple timestep embedding
+        temb = self.timestep_embedding(action_t, traj3d_t, next_obs_t)
+
+        # Concatenate sequence
+        registers = self.registers.expand(B, -1, -1)
+        x = torch.cat((action_embed, traj3d_embed, next_obs_embed, registers), dim=1)
+        x = x + self.pos_embed
+        
+        cond = torch.cat((global_cond, temb), dim=-1)
+        for block in self.blocks:
+            x = block(x, cond)
+        x = self.head(x, cond)
+
+        # Extract predictions
+        action_noise_pred = x[:, self.action_inds[0] : self.action_inds[1]]
+        traj3d_noise_pred = x[:, self.traj3d_inds[0] : self.traj3d_inds[1]]
+        next_obs_noise_pred = x[:, self.next_obs_inds[0] : self.next_obs_inds[1]]
+
+        # Decode outputs
+        action_noise_pred = self.action_decoder(action_noise_pred)
+        traj3d_noise_pred = self.traj3d_decoder(traj3d_noise_pred)
+        traj3d_noise_pred = traj3d_noise_pred.reshape(B, self.traj3d_len, self.traj3d_points, self.traj3d_dim)
+        next_obs_noise_pred = self.obs_patchifier.unpatchify(next_obs_noise_pred)
+
+        return action_noise_pred, traj3d_noise_pred, next_obs_noise_pred
+
+
 class UnifiedWorldModelWithMotion(nn.Module):
     def __init__(
         self,
@@ -327,10 +541,16 @@ class UnifiedWorldModelWithMotion(nn.Module):
         num_inference_steps: int = 10,
         beta_schedule="squaredcos_cap_v2",
         clip_sample=True,
+        use_triple_timestep: bool = True,
     ):
         """
         Assumes rgb input: (B, T, H, W, C) uint8 image
         Assumes low_dim input: (B, T, D)
+        
+        Args:
+            use_triple_timestep: If True and traj3d is enabled, use TriNoisePredictionNet 
+                                 with TripleTimestepEncoder (3 independent timesteps).
+                                 If False, use DualNoisePredictionNet with DualTimestepEncoder.
         """
 
         super().__init__()
@@ -338,13 +558,16 @@ class UnifiedWorldModelWithMotion(nn.Module):
         self.action_dim = action_dim
         self.action_shape = (action_len, action_dim)
 
-        # 3D Trajectory parameters (照搬 action 的处理方式)
+        # 3D Trajectory parameters
         self.use_traj3d = traj3d_len > 0 and traj3d_points > 0
         self.traj3d_len = traj3d_len
         self.traj3d_points = traj3d_points
         self.traj3d_dim = traj3d_dim
         if self.use_traj3d:
             self.traj3d_shape = (traj3d_len, traj3d_points, traj3d_dim)
+        
+        # 只有在 use_traj3d 为 True 时才能使用 triple timestep
+        self.use_triple_timestep = use_triple_timestep and self.use_traj3d
 
         # Image augmentation
         self.obs_encoder = obs_encoder
@@ -354,25 +577,49 @@ class UnifiedWorldModelWithMotion(nn.Module):
         global_cond_dim = self.obs_encoder.feat_dim()
         image_shape = self.latent_img_shape[2:]
         num_views, num_chans = self.latent_img_shape[:2]
-        self.noise_pred_net = DualNoisePredictionNet(
-            global_cond_dim=global_cond_dim,
-            image_shape=image_shape,
-            patch_shape=latent_patch_shape,
-            num_chans=num_chans,
-            num_views=num_views,
-            action_len=action_len,
-            action_dim=action_dim,
-            traj3d_len=traj3d_len,
-            traj3d_points=traj3d_points,
-            traj3d_dim=traj3d_dim,
-            embed_dim=embed_dim,
-            timestep_embed_dim=timestep_embed_dim,
-            depth=depth,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            qkv_bias=qkv_bias,
-            num_registers=num_registers,
-        )
+        
+        if self.use_triple_timestep:
+            print("[UWM Motion] Using TriNoisePredictionNet with TripleTimestepEncoder (3 timesteps)")
+            self.noise_pred_net = TriNoisePredictionNet(
+                global_cond_dim=global_cond_dim,
+                image_shape=image_shape,
+                patch_shape=latent_patch_shape,
+                num_chans=num_chans,
+                num_views=num_views,
+                action_len=action_len,
+                action_dim=action_dim,
+                traj3d_len=traj3d_len,
+                traj3d_points=traj3d_points,
+                traj3d_dim=traj3d_dim,
+                embed_dim=embed_dim,
+                timestep_embed_dim=timestep_embed_dim,
+                depth=depth,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                num_registers=num_registers,
+            )
+        else:
+            print("[UWM Motion] Using DualNoisePredictionNet with DualTimestepEncoder (2 timesteps)")
+            self.noise_pred_net = DualNoisePredictionNet(
+                global_cond_dim=global_cond_dim,
+                image_shape=image_shape,
+                patch_shape=latent_patch_shape,
+                num_chans=num_chans,
+                num_views=num_views,
+                action_len=action_len,
+                action_dim=action_dim,
+                traj3d_len=traj3d_len,
+                traj3d_points=traj3d_points,
+                traj3d_dim=traj3d_dim,
+                embed_dim=embed_dim,
+                timestep_embed_dim=timestep_embed_dim,
+                depth=depth,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                num_registers=num_registers,
+            )
 
         # Diffusion scheduler
         self.num_train_steps = num_train_steps
@@ -558,17 +805,37 @@ class UnifiedWorldModelWithMotion(nn.Module):
         next_obs_sample = torch.randn(
             (obs_feat.shape[0],) + self.latent_img_shape, device=obs_feat.device
         )
+        
+        # Initialize traj3d if using it
+        if self.use_traj3d:
+            traj3d_sample = torch.randn(
+                (obs_feat.shape[0],) + self.traj3d_shape, device=obs_feat.device
+            )
+        else:
+            traj3d_sample = None
 
         # Sampling steps
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
         for t in self.noise_scheduler.timesteps:
-            action_noise_pred, next_obs_noise_pred = self.noise_pred_net(
-                obs_feat, action_sample, t, next_obs_sample, t
-            )
+            if self.use_traj3d:
+                action_noise_pred, traj3d_noise_pred, next_obs_noise_pred = self.noise_pred_net(
+                    obs_feat, action_sample, t, next_obs_sample, t, traj3d_sample, t
+                )
+                traj3d_sample = self.noise_scheduler.step(
+                    traj3d_noise_pred, t, traj3d_sample
+                ).prev_sample
+            else:
+                action_noise_pred, _, next_obs_noise_pred = self.noise_pred_net(
+                    obs_feat, action_sample, t, next_obs_sample, t
+                )
+            
             next_obs_sample = self.noise_scheduler.step(
                 next_obs_noise_pred, t, next_obs_sample
             ).prev_sample
             action_sample = self.noise_scheduler.step(
                 action_noise_pred, t, action_sample
             ).prev_sample
+        
+        if self.use_traj3d:
+            return next_obs_sample, action_sample, traj3d_sample
         return next_obs_sample, action_sample
